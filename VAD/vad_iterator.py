@@ -38,62 +38,76 @@ class VADIterator:
         self.is_speaking = False
         self.buffer = []
 
+        # Validate sample rate - Silero VAD only supports these rates
         if sampling_rate not in [8000, 16000]:
             raise ValueError(
                 "VADIterator does not support sampling rates other than [8000, 16000]"
             )
 
+        # Convert time durations to sample counts for processing
         self.min_silence_samples = sampling_rate * min_silence_duration_ms / 1000
         self.speech_pad_samples = sampling_rate * speech_pad_ms / 1000
         self.reset_states()
 
     def reset_states(self):
-        self.model.reset_states()
-        self.triggered = False
-        self.temp_end = 0
-        self.current_sample = 0
+        """Reset all internal states for new audio stream."""
+        self.model.reset_states()  # Reset VAD model's internal state
+        self.triggered = False     # Currently detecting speech
+        self.temp_end = 0         # Temporary marker for potential speech end
+        self.current_sample = 0   # Current position in audio stream
 
-    @torch.no_grad()
+    @torch.no_grad()  # Disable gradients for inference efficiency
     def __call__(self, x):
         """
-        x: torch.Tensor
-            audio chunk (see examples in repo)
-
-        return_seconds: bool (default - False)
-            whether return timestamps in seconds (default - samples)
+        Process audio chunk and return complete speech segment when detected.
+        
+        Args:
+            x: Audio chunk as torch.Tensor
+            
+        Returns:
+            List of audio tensors representing complete speech segment, or None
         """
-
+        # Ensure input is a tensor
         if not torch.is_tensor(x):
             try:
                 x = torch.Tensor(x)
             except Exception:
                 raise TypeError("Audio cannot be casted to tensor. Cast it manually")
 
+        # Track current position in audio stream
         window_size_samples = len(x[0]) if x.dim() == 2 else len(x)
         self.current_sample += window_size_samples
 
+        # Get speech probability from VAD model (0-1, higher = more likely speech)
         speech_prob = self.model(x, self.sampling_rate).item()
 
+        # If speech detected during potential ending, cancel the ending
         if (speech_prob >= self.threshold) and self.temp_end:
             self.temp_end = 0
 
+        # Start speech detection when threshold exceeded
         if (speech_prob >= self.threshold) and not self.triggered:
             self.triggered = True
             return None
 
+        # End speech detection with hysteresis (threshold - 0.15 to avoid flickering)
         if (speech_prob < self.threshold - 0.15) and self.triggered:
             if not self.temp_end:
+                # Mark potential end of speech
                 self.temp_end = self.current_sample
+            
+            # Check if we've had enough silence to confirm speech end
             if self.current_sample - self.temp_end < self.min_silence_samples:
                 return None
             else:
                 # end of speak
                 self.temp_end = 0
                 self.triggered = False
-                spoken_utterance = self.buffer
-                self.buffer = []
+                spoken_utterance = self.buffer  # Get accumulated speech chunks
+                self.buffer = []               # Clear buffer for next speech
                 return spoken_utterance
 
+        # Accumulate audio chunks while speech is active
         if self.triggered:
             self.buffer.append(x)
 
